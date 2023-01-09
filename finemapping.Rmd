@@ -1,0 +1,483 @@
+---
+title: "Finemapping"
+author:
+  - name: Josh Weinstock
+date: "`r Sys.Date()`"
+params:
+    chrom: "chr3"
+    start: 160195572
+    end: 160689399
+    summary_stats_file: "/net/topmed2/working/jweinstk/count_singletons/annotation_singletons/encore_output_download/semi_supervised_gwas.txt.gz"
+    phenotype_file: "/net/topmed2/working/jweinstk/count_singletons/annotation_singletons/encore_input/semi_supervised_output_2022_12_28.tsv"
+    bcf_file: "/net/topmed2/working/gt-release/exchange-area/freeze.10b/minDP0/freeze.10b.chr3.pass_and_fail.gtonly.minDP0.bcf"
+    python: "/net/fantasia/home/jweinstk/anaconda3/bin/python"
+    ABC_bed: "/net/topmed2/working/jweinstk/count_singletons/new_drivers/ABC/liftover/AllPredictions.AvgHiC.ABC0.015.minus150.ForABCPaperV3.liftover.bed.gz"
+    ABC_cell_type: "CD34-positive_mobilized-Roadmap"
+    ABC_gene: "SMC4"
+output: 
+    distill::distill_article:
+        toc: true
+---
+
+```{r setup, include=FALSE, cache=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"))
+```
+
+```{r load, include=FALSE, cache = TRUE}
+library("tidyverse")
+library("glue")
+library("reticulate")
+library("tictoc")
+
+bcf_file = params$bcf_file
+csi_file = glue("{bcf_file}.csi")
+region = glue("{params$chrom}:{params$start}-{params$end}")
+use_python(params$python)
+
+phenotype = vroom::vroom(params$phenotype_file)
+```
+
+```{python parse, cache = TRUE}
+import cyvcf2 as cyvcf
+import numpy as np
+import pandas as pd
+
+reader = cyvcf.VCF(r.bcf_file, gts012 = True, samples = r.phenotype.NWD_ID.values.tolist())
+variants = []
+
+samples = reader.samples
+
+MAC_THRESHOLD = 500
+N_SAMPLES = len(samples)
+
+gt_list = []
+chrom_list = []
+pos_list = []
+ref_list = []
+alt_list = []
+ac_list = []
+af_list = []
+for v in reader(r.region):
+    #AC = v.INFO.get("AC")
+    gt = v.gt_types.astype(np.int8)
+    AC = np.sum(gt)
+    MIN_AC = min(AC, 2 * N_SAMPLES - AC)
+    if MIN_AC >= MAC_THRESHOLD and v.FILTER is None:
+        chrom = v.CHROM
+        pos = v.POS
+        ref = v.REF
+        alt = "".join(v.ALT)
+        ac_list.append(AC)
+        af_list.append(v.INFO.get("AF"))
+        variants.append(f"{chrom}-{pos}-{ref}-{alt}")
+        gt_list.append(gt)
+
+        chrom_list.append(chrom)
+        pos_list.append(pos)
+        ref_list.append(ref)
+        alt_list.append(alt)
+
+variant_meta = pd.DataFrame({
+    "CHROM" : chrom_list,
+    "POS"   : pos_list,
+    "REF"   : ref_list,
+    "ALT"   : alt_list,
+    "AC"    : ac_list,
+    "AF"    : af_list,
+    "ID"    : variants
+})
+genotypes = np.vstack(gt_list)
+```
+
+```{r conv, cache = TRUE}
+library("Matrix")
+tic()
+genotypes = t(py$genotypes)
+colnames(genotypes) = py$variants
+rownames(genotypes) = py$samples
+sparse_genotypes = Matrix::Matrix(genotypes, sparse = TRUE)
+ld = coop::pcor(genotypes)
+ld2 = ld ^ 2
+variant_meta = tibble::as_tibble(py$variant_meta)
+toc()
+```
+
+```{r finemap, cache = FALSE}
+library("susieR")
+inverse_normalize = function(x) {
+    # rank sorts in ascending order!
+    qnorm(rank(x, na.last = "keep") / (sum(!is.na(x)) + 1))
+}
+set.seed(1)
+
+remove_covariate_effects <- function (X, Z, y) {
+  # include the intercept term
+  if (any(Z[,1]!=1)) Z = cbind(1, Z)
+  A   <- forceSymmetric(crossprod(Z))
+  SZy <- as.vector(solve(A,c(y %*% Z)))
+  SZX <- as.matrix(solve(A,t(Z) %*% X))
+  y <- y - c(Z %*% SZy)
+  X <- X - Z %*% SZX
+  return(list(X = X,y = y,SZy = SZy,SZX = SZX))
+}
+
+#out = remove.covariate.effects(X, Z, Y[,1])
+
+fit_susie = function(phenotype, phenotype_string = "estimated_counts", genotypes, covariates) {
+    covariate_string = glue_collapse(covariates, " + ")
+    formula = as.formula(glue("{phenotype_string} ~ {covariate_string}"))
+
+    Z = model.matrix(formula, data = phenotype)
+
+
+    out = remove_covariate_effects(genotypes, Z, phenotype[[phenotype_string]])
+
+    susie_model = susie(
+        out$X,
+        inverse_normalize(out$y),
+        L = 3,
+        coverage = 0.05,
+        tol = 0.0001,
+        max_iter = 100,
+        refine = TRUE,
+        verbose = TRUE
+    )
+    list(
+        "susie" = susie_model,
+        "regress_covariates" = out
+    )
+}
+
+```
+
+```{r ABC}
+
+ABC_bed = params$ABC_bed
+ABC_cell_type = params$ABC_cell_type
+ABC_gene = params$ABC_gene
+ABC_cmd  = glue::glue("tabix {ABC_bed} {region}")
+ABC_headers = c("CHROM", "START", "END", "width", "strand", "name_b38", "class",
+        "activity_base", "TargetGene", "TargetGeneExpression", "TargetGenePromoterActivityQuantile",
+        "TargetGeneIsExpressed", "distance", "isSelfPromoter", "hic_contact",
+        "powerlaw_contact", "powerlaw_contact_reference", "hic_contact_pl_scaled",
+        "hic_pseudocount", "hic_contact_pl_scaled_adj", "ABC.Score.Numerator",
+        "ABC.Score", "powerlaw.Score.Numerator", "powerlaw.Score", "CellType",
+        "ID", "TargetGeneTSS")
+ABC = data.table::fread(cmd = ABC_cmd) %>%
+    tibble::as_tibble(.) %>%
+    setNames(ABC_headers) %>%
+    dplyr::filter(CellType == .env[["ABC_cell_type"]]) %>%
+    dplyr::select(
+        CHROM,
+        start = START,
+        end = END,
+        class,
+        TargetGene,
+        target = TargetGeneTSS
+    ) %>%
+    dplyr::distinct(.)
+
+```
+
+```{r locus, cache = TRUE, layout="l-body-outset", fig.width=8, fig.height=6.5}
+library("biomaRt")
+library("patchwork")
+
+get_rsid = function(chrom = "3", position) {
+    mart = useMart(
+                biomart = "ENSEMBL_MART_SNP", 
+                #path="/biomart/martservice",
+                dataset="hsapiens_snp",
+                host = "asia.ensembl.org"
+    )
+
+    getBM(
+        attributes = c('refsnp_id'),
+        filters = c('chr_name','start','end'),
+        values = list(chrom, position, position),
+        mart = mart
+    )
+}
+
+get_rsid = memoise::memoise(get_rsid)
+
+get_snp_to_gene = function(variant_meta) {
+    gene_bm = useEnsembl(
+        biomart = "ensembl", 
+        dataset = "hsapiens_gene_ensembl",
+        host = "asia.ensembl.org"
+    ) 
+    
+    snp_to_gene = getBM(
+            attributes = c(
+                'start_position',
+                'end_position',
+                'ensembl_gene_id',
+                'external_gene_name', 
+                'gene_biotype',
+                'exon_chrom_start',
+                'exon_chrom_end'
+            ),
+            filters = c('chromosome_name','start','end'), 
+            values = list(
+                as.integer(stringr::str_replace(unique(variant_meta$CHROM), "chr", "")), # must be numeric
+                min(variant_meta$POS) + 1e3,
+                max(variant_meta$POS) - 1e3
+            ),
+            mart = gene_bm
+    )
+    return(snp_to_gene)
+}
+
+if(sum(snp_to_gene$external_gene_name == "") > 0) {
+
+    cat("gene tracks include a gene without a gene symbol; now removing\n")
+
+    snp_to_gene %>%
+        dplyr::filter(external_gene_name == "") %>%
+        tibble::as_tibble(.) %>%
+        print
+        
+    snp_to_gene = get_snp_to_gene(variant_meta) %>%
+        dplyr::filter(external_gene_name != "")
+}
+
+valid_biotypes = c("protein_coding")
+filter_biotype = . %>%
+    dplyr::filter(gene_biotype %in% valid_biotypes)
+
+locuszoom = function(variant_meta, susie_model, ld2, snp_to_gene, ABC) {
+
+    dfm = variant_meta
+    dfm$pip = susie_model$pip
+
+    interesting_snp = which.max(dfm$pip)
+
+    dfm$ld2 = ld2[, interesting_snp]
+
+    cat(glue::glue("LD computed with respect to {dfm$ID[interesting_snp]}\n"))
+
+    p1 = ggplot(data = dfm) +
+        scale_x_continuous(
+                breaks = seq(min(dfm$POS), max(dfm$POS), length.out = 7),
+                labels = round(seq(min(dfm$POS), max(dfm$POS), length.out = 7) / 1e6, 2),
+                expand = c(0, 1e4)
+        ) + 
+        scale_y_continuous(
+                labels = scales::percent,
+                limits = c(0, 1),
+                expand = c(.01, .01)
+        )
+
+    if(!is.null(ABC)) {
+        p1 = p1 +
+            geom_rect(
+                data = ABC %>% dplyr::filter(TargetGene == .env[["ABC_gene"]]),
+                aes(xmin = start, xmax = end, ymin = 0, ymax = 1),
+                fill = "gray",
+                alpha = 0.2
+            )
+    }
+
+    p1 = p1 +
+        scale_fill_distiller(palette = "Spectral") + 
+        geom_point(
+                data = dfm, 
+                aes(x = POS, y = pip, fill = ld2),
+                color = "black", shape = 21, size = 1.5
+                ) +
+        #ggtitle(glue("Highlighted point is {rsid} at {interesting_snp_position}")) +
+        labs(x = "position (Mb)", y = expression(PIP), fill = expression(r^{2})) +
+        cowplot::theme_cowplot() +
+        theme(
+                axis.title = element_text(size = 16),
+                plot.title = element_text(size = 17, vjust = 2),
+                axis.text = element_text(size = 14),
+                legend.key.width = unit(.5, "cm"),
+                legend.position = c(.9, .75),
+             ) 
+
+    if(!is.null(susie_model$sets)) {
+        L = length(susie_model$sets$cs_index)   
+
+        L_max = pmin(L, 3)
+        shapes = c(24, 23, 22)
+
+        for (l in 1:L_max) {
+
+            k = susie_model$sets$cs[[glue::glue("L{l}")]]
+            p1 = p1 + 
+                geom_point(
+                        data = dfm %>% dplyr::slice(k), 
+                        aes(x = POS, y = pip), 
+                        shape = shapes[l], 
+                        color = "black", 
+                        fill = "purple", 
+                        size = 3
+                    ) 
+        }
+    }
+
+
+    p2 <- ggplot() + 
+        geom_linerange(aes(
+                    x = external_gene_name, 
+                    ymin = start_position, 
+                    ymax = end_position, 
+                ),
+            size = 1.2,
+            color = "darkblue",
+            data = snp_to_gene %>% filter_biotype %>% dplyr::select(start_position:gene_biotype) %>% distinct
+        ) +
+        geom_linerange(
+                aes(
+                    x = external_gene_name, 
+                    ymin = exon_chrom_start, 
+                    ymax = exon_chrom_end 
+                ),
+            size =  3.3,
+            color = "darkblue",
+            data = snp_to_gene %>% filter_biotype
+        ) +
+        coord_flip() + 
+        ylab("") +
+        scale_y_continuous(
+                breaks = seq(min(dfm$POS), max(dfm$POS), length.out = 7),
+                labels = round(seq(min(dfm$POS), max(dfm$POS), length.out = 7) / 1e6, 2),
+                limits = c(min(dfm$POS), max(dfm$POS)),
+                expand = c(0, 1e4)
+        ) +
+        geom_text(
+                aes(
+                    x = external_gene_name, 
+                    y = (start_position + end_position) / 2, 
+                    label = external_gene_name
+                ), 
+                fontface = 2, 
+                nudge_x = .4,
+                alpha = I(0.7), 
+                hjust = "center", 
+                size = 4.1,
+                data = snp_to_gene %>% filter_biotype %>% dplyr::select(start_position:gene_biotype) %>% distinct
+        ) + 
+        theme_void() 
+
+
+    p = p1 + p2 + plot_layout(ncol = 1, heights = c(5, 2.7))
+    p
+
+}
+```
+
+```{r read_summary}
+cmd = glue::glue("tabix {summary_stats_file} {region}")
+summary_stats = data.table::fread(cmd = cmd) %>%
+    tibble::as_tibble(.) %>%
+    setNames(c(
+        "CHROM",
+        "POS",
+        "SNPID",
+        "Allele1",
+        "Allele2",
+        "AC_Allele2",
+        "AF_Allele2",
+        "imputationInfo",
+        "N",
+        "BETA",
+        "SE",
+        "Tstat",
+        "p.value",
+        "varT",
+        "varTstar"
+    )) %>%
+    dplyr::mutate(
+        ID = glue::glue("{CHROM}-{POS}-{Allele1}-{Allele2}")
+    ) %>%
+    dplyr::filter(ID %in% py$variants)
+```
+
+```{r rss}
+rss = susie_rss(
+    R = ld[summary_stats$ID, summary_stats$ID],
+    n = summary_stats$N[1],
+    bhat =summary_stats$BETA,
+    shat = summary_stats$SE
+)
+```
+
+```{r, cache = FALSE}
+#tic()
+#susie_model_pcs = fit_susie(
+#        counts %>%
+#            dplyr::filter(NWD_ID %in% py$samples),
+#        "estimated_counts",
+        # sparse_genotypes, 
+#        genotypes,
+#        c(
+#            glue("PC{1:10}"),
+#            "age",
+#            "VB_DEPTH",
+#            "study",
+#            "INFERRED_SEX"
+        #    "residual"
+#        )
+#    )
+
+#toc()
+```
+
+```{r locus2, cache = FALSE, layout="l-body-outset", fig.width=8, fig.height=6, dev = 'pdf', dev.args = NULL}
+locuszoom(
+    variant_meta %>% dplyr::filter(ID %in% summary_stats$ID),
+    #susie_model_pcs[["susie"]], 
+    rss,
+    ld2[summary_stats$ID, summary_stats$ID],
+    snp_to_gene,
+    ABC
+)
+```
+
+```{r print, results='asis'}
+
+if(!is.null(rss$sets)) {
+
+    L = length(rss$sets$cs_index)   
+
+    for (l in 1:L) {
+        k = rss$sets$cs[[glue::glue("L{l}")]]
+        cat(glue::glue("now printing out credible set {l} with {length(k)} variants\n")) 
+        causal_snps = summary_stats %>%
+            dplyr::mutate(
+                pip = rss$pip
+            ) %>%
+            dplyr::slice(rss$sets$cs[[glue::glue("L{l}")]]) %>%
+            dplyr::select(
+                seqnames = CHROM,
+                start = POS,
+                SNPID,
+                ID,
+                AC_Allele2,
+                AF_Allele2,
+                N,
+                BETA,
+                SE,
+                p.value,
+                pip
+            ) %>%
+            plyranges::as_granges(.) %>%
+            plyranges::join_overlap_left(plyranges::as_granges(ABC)) %>%
+            GenomicRanges::as.data.frame(.)
+
+        readr::write_tsv(causal_snps, glue::glue("causal_snps_cs_{l}.tsv"))
+
+        causal_snps %>%
+            knitr::kable(.) %>%
+            print
+    }
+}
+
+cat("### ABC information\n\n")
+
+print(kable(knitr::kable(ABC)))
+```
