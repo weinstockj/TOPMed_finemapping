@@ -270,9 +270,9 @@ locuszoom = function(variant_meta, susie_model, ld2, snp_to_gene, ABC) {
 
     p1 = ggplot(data = dfm) +
         scale_x_continuous(
-                breaks = seq(min(dfm$POS), max(dfm$POS), length.out = 7),
-                labels = round(seq(min(dfm$POS), max(dfm$POS), length.out = 7) / 1e6, 2),
-                expand = c(0, 1e4)
+                breaks = seq(min(dfm$POS), max(dfm$POS), length.out = 6),
+                labels = round(seq(min(dfm$POS), max(dfm$POS), length.out = 6) / 1e6, 2),
+                expand = c(0, 1e3)
         ) + 
         scale_y_continuous(
                 labels = scales::percent,
@@ -409,12 +409,14 @@ summary_stats = data.table::fread(cmd = cmd) %>%
 ```
 
 ```{r rss}
+set.seed(1)
 rss = susie_rss(
     R = ld[summary_stats$ID, summary_stats$ID],
     n = summary_stats$N[1],
     bhat =summary_stats$BETA,
     shat = summary_stats$SE,
-    max_iter = 300,
+    L = 5,
+    max_iter = 400,
     verbose = TRUE,
     refine = TRUE
 )
