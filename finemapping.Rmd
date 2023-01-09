@@ -154,6 +154,7 @@ fit_susie = function(phenotype, phenotype_string = "estimated_counts", genotypes
 
 ```{r ABC}
 
+library(magrittr)
 ABC_bed = params$ABC_bed
 ABC_cell_types = unlist(stringr::str_split(params$ABC_cell_types, pattern = ","))
 ABC_genes = unlist(stringr::str_split(params$ABC_genes, pattern = ","))
@@ -311,8 +312,8 @@ locuszoom = function(variant_meta, susie_model, ld2, snp_to_gene, ABC) {
     if(!is.null(susie_model$sets)) {
         L = length(susie_model$sets$cs_index)   
 
-        L_max = pmin(L, 3)
-        shapes = c(24, 23, 22)
+        L_max = pmin(L, 5)
+        shapes = c(24, 23, 22, 3, 4)
 
         for (l in 1:L_max) {
 
@@ -412,7 +413,10 @@ rss = susie_rss(
     R = ld[summary_stats$ID, summary_stats$ID],
     n = summary_stats$N[1],
     bhat =summary_stats$BETA,
-    shat = summary_stats$SE
+    shat = summary_stats$SE,
+    max_iter = 300,
+    verbose = TRUE,
+    refine = TRUE
 )
 ```
 
