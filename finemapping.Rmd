@@ -12,8 +12,8 @@ params:
     bcf_file: "/net/topmed2/working/gt-release/exchange-area/freeze.10b/minDP0/freeze.10b.chr3.pass_and_fail.gtonly.minDP0.bcf"
     python: "/net/fantasia/home/jweinstk/anaconda3/bin/python"
     ABC_bed: "/net/topmed2/working/jweinstk/count_singletons/new_drivers/ABC/liftover/AllPredictions.AvgHiC.ABC0.015.minus150.ForABCPaperV3.liftover.bed.gz"
-    ABC_cell_type: "CD34-positive_mobilized-Roadmap"
-    ABC_gene: "SMC4"
+    ABC_cell_types: "CD34-positive_mobilized-Roadmap"
+    ABC_genes: "SMC4"
 output: 
     distill::distill_article:
         toc: true
@@ -24,11 +24,12 @@ knitr::opts_chunk$set(echo = FALSE)
 knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"))
 ```
 
-```{r load, include=FALSE, cache = TRUE}
+```{r load, include=FALSE, cache=TRUE}
 library("tidyverse")
 library("glue")
 library("reticulate")
 library("tictoc")
+library("magrittr")
 
 bcf_file = params$bcf_file
 csi_file = glue("{bcf_file}.csi")
@@ -154,8 +155,8 @@ fit_susie = function(phenotype, phenotype_string = "estimated_counts", genotypes
 ```{r ABC}
 
 ABC_bed = params$ABC_bed
-ABC_cell_type = params$ABC_cell_type
-ABC_gene = params$ABC_gene
+ABC_cell_types = unlist(stringr::str_split(params$ABC_cell_types, pattern = ","))
+ABC_genes = unlist(stringr::str_split(params$ABC_genes, pattern = ","))
 ABC_cmd  = glue::glue("tabix {ABC_bed} {region}")
 ABC_headers = c("CHROM", "START", "END", "width", "strand", "name_b38", "class",
         "activity_base", "TargetGene", "TargetGeneExpression", "TargetGenePromoterActivityQuantile",
@@ -164,20 +165,25 @@ ABC_headers = c("CHROM", "START", "END", "width", "strand", "name_b38", "class",
         "hic_pseudocount", "hic_contact_pl_scaled_adj", "ABC.Score.Numerator",
         "ABC.Score", "powerlaw.Score.Numerator", "powerlaw.Score", "CellType",
         "ID", "TargetGeneTSS")
+
 ABC = data.table::fread(cmd = ABC_cmd) %>%
     tibble::as_tibble(.) %>%
     setNames(ABC_headers) %>%
-    dplyr::filter(CellType == .env[["ABC_cell_type"]]) %>%
+    dplyr::filter(CellType %in% .env[["ABC_cell_types"]]) %>%
     dplyr::select(
         CHROM,
         start = START,
         end = END,
         class,
+        CellType,
         TargetGene,
         target = TargetGeneTSS
     ) %>%
     dplyr::distinct(.)
 
+ABC_grange = ABC %>%
+    dplyr::rename(seqnames = CHROM) %>%
+    plyranges::as_granges(.)
 ```
 
 ```{r locus, cache = TRUE, layout="l-body-outset", fig.width=8, fig.height=6.5}
@@ -189,7 +195,7 @@ get_rsid = function(chrom = "3", position) {
                 biomart = "ENSEMBL_MART_SNP", 
                 #path="/biomart/martservice",
                 dataset="hsapiens_snp",
-                host = "asia.ensembl.org"
+                host = "https://asia.ensembl.org"
     )
 
     getBM(
@@ -230,6 +236,8 @@ get_snp_to_gene = function(variant_meta) {
     return(snp_to_gene)
 }
 
+snp_to_gene = get_snp_to_gene(variant_meta) 
+
 if(sum(snp_to_gene$external_gene_name == "") > 0) {
 
     cat("gene tracks include a gene without a gene symbol; now removing\n")
@@ -237,9 +245,10 @@ if(sum(snp_to_gene$external_gene_name == "") > 0) {
     snp_to_gene %>%
         dplyr::filter(external_gene_name == "") %>%
         tibble::as_tibble(.) %>%
+        dplyr::glimpse(.) %>%
         print
         
-    snp_to_gene = get_snp_to_gene(variant_meta) %>%
+    snp_to_gene = snp_to_gene %>%
         dplyr::filter(external_gene_name != "")
 }
 
@@ -273,10 +282,11 @@ locuszoom = function(variant_meta, susie_model, ld2, snp_to_gene, ABC) {
     if(!is.null(ABC)) {
         p1 = p1 +
             geom_rect(
-                data = ABC %>% dplyr::filter(TargetGene == .env[["ABC_gene"]]),
+                data = ABC %>% dplyr::filter(TargetGene %in% .env[["ABC_genes"]]),
                 aes(xmin = start, xmax = end, ymin = 0, ymax = 1),
+                inherit.aes = FALSE,
                 fill = "gray",
-                alpha = 0.2
+                alpha = 0.35
             )
     }
 
@@ -371,7 +381,7 @@ locuszoom = function(variant_meta, susie_model, ld2, snp_to_gene, ABC) {
 ```
 
 ```{r read_summary}
-cmd = glue::glue("tabix {summary_stats_file} {region}")
+cmd = glue::glue("tabix {params$summary_stats_file} {region}")
 summary_stats = data.table::fread(cmd = cmd) %>%
     tibble::as_tibble(.) %>%
     setNames(c(
@@ -465,8 +475,9 @@ if(!is.null(rss$sets)) {
                 p.value,
                 pip
             ) %>%
+            dplyr::mutate(end = start) %>%
             plyranges::as_granges(.) %>%
-            plyranges::join_overlap_left(plyranges::as_granges(ABC)) %>%
+            plyranges::join_overlap_left(ABC_grange) %>%
             GenomicRanges::as.data.frame(.)
 
         readr::write_tsv(causal_snps, glue::glue("causal_snps_cs_{l}.tsv"))
@@ -479,5 +490,5 @@ if(!is.null(rss$sets)) {
 
 cat("### ABC information\n\n")
 
-print(kable(knitr::kable(ABC)))
+print(knitr::kable(ABC))
 ```
